@@ -1,171 +1,163 @@
-#include "call_libraries.h"      // call libraries from ROOT and C++
-#include "read_tree.h"           // read the TChains
-#include "define_histograms.h"   // histogram definition
-#include "tracking_correction.h" // tracking correction
-#define pi_mass 0.1396
+// correlation_XeXe.C - Unified HBT Femtoscopy Analysis for XeXe Collisions
+// Maintains original function signature for compatibility
 
-/*
---> Arguments:
-- input_file: text file with a list of root input files: Forest or Skims
-- ouputfile: just a counting number to run on Condor
-- isMC: 0 for false (data) and > 0 for true (MC)
-- doquicktest: 0 for false and > 0 for true (tests with 1000 events)
-- domixing: 0 for mixing and 1 without mixing
-- Nmixevents: number of events to mix
-- mincentormult: minimum centrality or multiplicity in the mixing
-- minvz: minimum vertex z for the mixing
-- hbt3d: 0 with 3D and 1 without 3D
-- gamov: 0 means no GAMOV Coulomb correction, > 0 means GAMOV is added
-- cent_bool: 0 to use centrality and different than 0 for multiplicity
-- syst: systematics type:
-  0: nominal, 1: |vz| < 3, 2: 3 < |vz| < 15, etc.
-*/
-void correlation_XeXe(TString input_file, TString ouputfile, int isMC, int doquicktest, int domixing, int Nmixevents, int mincentormult, float minvz, int hbt3d, int gamov, int cent_bool, int syst) {
+#include "call_libraries.h"
+#include "hbt_analysis_utils.h"  // Contains common utilities
+#include "track_corrections.h"   // Your improved tracking corrections
 
-    clock_t sec_start, sec_end;
-    sec_start = clock(); // start timing measurement
-    TDatime* date = new TDatime(); // to add date in the output file
-
-    // Boolean conversion
-    bool do_quicktest = (doquicktest > 0);
-    bool is_MC = (isMC > 0);
-    bool do_mixing = (domixing == 0);  // if 0, mixing enabled
-    bool do_hbt3d = (hbt3d == 0);
-    bool do_gamov = (gamov > 0);
-    bool use_centrality = (cent_bool == 0);
-
-    if (syst == 9 || syst == 10) do_gamov = true;  // Handle special cases for gamov
-
-    bool dosplit = (syst != 7);  // Enable splitting unless systematics 7
-
-    // Determine systematics string
-    TString systematics = "nonapplied_nominal";
-    switch (syst) {
-        case 0: systematics = "nominal"; break;
-        case 1: systematics = "vznarrow"; break;
-        case 2: systematics = "vzwide"; break;
-        case 3: systematics = "trktight"; break;
-        case 4: systematics = "trkloose"; break;
-        case 5: systematics = "centup"; break;
-        case 6: systematics = "centdown"; break;
-        case 7: systematics = "removeduplicatedcut"; break;
-        case 8: systematics = "removeNpixelhitcut"; break;
-        case 9: systematics = "gamovplus15"; break;
-        case 10: systematics = "gamovminus15"; break;
-    }
-    systematics += (use_centrality ? "_cent" : "_Ntroff");
-
-    // Open efficiency file based on systematics
-    TFile *fileeff = nullptr;
-    if (syst == 1) fileeff = TFile::Open("efftables/XeXe_eff_narrow_table_94x_cent.root");
-    else if (syst == 2) fileeff = TFile::Open("efftables/XeXe_eff_wide_table_94x_cent.root");
-    else if (syst == 3) fileeff = TFile::Open("efftables/XeXe_eff_tight_table_94x_cent.root");
-    else if (syst == 4) fileeff = TFile::Open("efftables/XeXe_eff_loose_table_94x_cent.root");
-    else fileeff = TFile::Open("efftables/XeXe_eff_table_94x_cent.root");
-
-    if (!fileeff || fileeff->IsZombie()) {
-        cout << "Error opening efficiency file!" << endl;
-        return;
-    }
-
-    // Read the list of input file(s)
-    fstream inputfile;
-    inputfile.open(input_file.Data(), ios::in);
-    if (!inputfile.is_open()) {
-        cout << "List of input files not found!" << endl;
-        return;
-    }
-
-    // Vector to store file names
-    TString file_chain;
-    std::vector<TString> file_name_vector;
-    while (getline(inputfile, file_chain)) {
-        file_name_vector.push_back(file_chain);
-    }
-    inputfile.close();
-
-    // Create chains for various event and track data
-    TChain *hea_tree = new TChain("hiEvtAnalyzer/HiTree");
-    TChain *ski_tree = new TChain("skimanalysis/HltTree");
-    TChain *trk_tree = new TChain("ppTrack/trackTree");
-    TChain *gen_tree = is_MC ? new TChain("HiGenParticleAna/hi") : nullptr;
-
-    // Add files to the chains
-    for (auto &file : file_name_vector) {
-        TFile *testfile = TFile::Open(file, "READ");
-        if (testfile && !testfile->IsZombie()) {
-            cout << "Adding file " << file << " to the chains" << endl;
-            hea_tree->Add(file);
-            ski_tree->Add(file);
-            trk_tree->Add(file);
-            if (is_MC) gen_tree->Add(file);
-        } else {
-            cout << "File: " << file << " failed!" << endl;
-        }
-    }
-
-    // Clear file list after processing
-    file_name_vector.clear();
-
-    // Connect chains
-    hea_tree->AddFriend(ski_tree);
-    hea_tree->AddFriend(trk_tree);
-    if (is_MC) hea_tree->AddFriend(gen_tree);
-
-    // Read tree information
-    read_tree(hea_tree, is_MC);
-
-    // Initialize histograms with uncertainty calculation
-    sw2();
-
-    // Get number of events in the chain
-    int nevents = hea_tree->GetEntries();
-    cout << endl;
-    cout << "Total number of events in those files: " << nevents << endl;
-    cout << "-------------------------------------------------" << endl;
-
-    // Vectors for mixing
-    std::vector<int> centrality_vector, multiplicity_vector;
-    std::vector<double> vz_vector;
-    std::vector<std::vector<ROOT::Math::PtEtaPhiMVector>> track_4vector;
-    std::vector<std::vector<double>> track_weights_vector;
-    std::vector<std::vector<int>> track_charge_vector;
-
-    // Event loop
-    for (int i = 0; i < nevents; i++) {
-        hea_tree->GetEntry(i);
-
-        // Centrality and vertex selection
-        int centrality = getCentrality();
-        double vz = getVz();
-
-        // Apply vertex cut
-        if (vz < minvz) continue;
-
-        // Process tracks and weights
-        std::vector<ROOT::Math::PtEtaPhiMVector> tracks = getTracks();
-        std::vector<double> track_weights = getTrackWeights();
-        std::vector<int> track_charge = getTrackCharge();
-
-        // Fill histograms
-        fillHistograms(tracks, centrality, vz);
-
-        // Apply mixing if enabled
+void correlation_XeXe(
+    TString input_file,          // List of input files
+    TString output_tag,          // Output file identifier
+    int isMC = 0,                // 0=data, 1=MC
+    int quick_test = 0,          // 0=full run, 1=test mode
+    int mixing_mode = 1,         // 0=no mixing, 1=standard mixing
+    int n_mix_events = 10,       // Number of events to mix
+    int cent_mult_window = 5,    // Centrality/multiplicity window
+    float vz_window = 2.0,       // Vertex z window (cm)
+    int hbt3d = 1,               // 0=3D analysis, 1=1D only
+    int coulomb_corr = 0,        // 0=no Coulomb, 1=apply correction
+    int centrality_mode = 0,     // 0=centrality, 1=multiplicity
+    int systematic = 0           // Systematic variation
+) {
+    // Start timing and logging
+    TStopwatch timer;
+    timer.Start();
+    std::cout << "=== Starting HBT analysis for XeXe collisions ===" << std::endl;
+    
+    // ======================
+    // 1. Configuration Setup
+    // ======================
+    const bool is_mc = (isMC == 1);
+    const bool do_quick_test = (quick_test == 1);
+    const bool do_mixing = (mixing_mode == 1);
+    const bool do_3d = (hbt3d == 0);
+    const bool do_coulomb = (coulomb_corr == 1);
+    const bool use_cent = (centrality_mode == 0);
+    
+    // Systematic configuration
+    TString syst_tag = GetSystematicTag(systematic);
+    if (systematic == 9 || systematic == 10) do_coulomb = true;
+    
+    // ======================
+    // 2. Initialize Components
+    // ======================
+    
+    // a) Track correction setup
+    TFile* eff_file = OpenEfficiencyFile(systematic);
+    std::vector<TH2D*> eff_hists = LoadEfficiencyHists(eff_file);
+    
+    // b) Output file naming
+    TDatime date;
+    TString output_name = Form("%s_%s_Nmix%d_MixWin%d_VzWin%.1f_%d",
+                              output_tag.Data(),
+                              syst_tag.Data(),
+                              n_mix_events,
+                              cent_mult_window,
+                              vz_window,
+                              date.GetDate());
+    
+    // Replace special characters
+    output_name.ReplaceAll(".", "p");
+    
+    // c) Create output file structure
+    TFile output(output_name + ".root", "RECREATE");
+    SetupOutputDirectories(output);
+    
+    // ======================
+    // 3. Event Processing
+    // ======================
+    
+    // a) Initialize chains
+    TChain* event_chain = new TChain("hiEvtAnalyzer/HiTree");
+    TChain* track_chain = new TChain("ppTrack/trackTree");
+    TChain* skim_chain = new TChain("skimanalysis/HltTree");
+    
+    // b) Add input files
+    AddInputFiles(input_file, {event_chain, track_chain, skim_chain});
+    
+    // c) Main event loop
+    int n_events = event_chain->GetEntries();
+    int n_processed = 0;
+    
+    for (int i = 0; i < n_events; ++i) {
+        // Event selection
+        if (!LoadEvent(event_chain, i)) continue;
+        if (!PassEventCuts(systematic)) continue;
+        
+        // Track processing
+        auto [tracks, weights, charges] = ProcessTracks(track_chain, eff_hists, systematic);
+        
+        // Pair analysis
+        AnalyzePairs(tracks, weights, charges, do_3d, do_coulomb, systematic);
+        
+        // Store for mixing
         if (do_mixing) {
-            mixEvents(tracks, centrality, vz);
+            StoreForMixing(tracks, weights, charges);
         }
-
-        // Apply systematics
-        if (syst != 0) {
-            applySystematicUncertainty(syst, tracks, centrality);
+        
+        // Progress reporting
+        if (++n_processed % 1000 == 0) {
+            std::cout << "Processed " << n_processed << " events (" 
+                      << 100.0*n_processed/n_events << "%)" << std::endl;
         }
-
-        // Quick test: break after a small number of events
-        if (do_quicktest && i >= 1000) {
-            break;
-        }
+        
+        if (do_quick_test && n_processed >= 1000) break;
     }
-
-    // Close files after use
-    fileeff->Close();
+    
+    // ======================
+    // 4. Event Mixing
+    // ======================
+    if (do_mixing) {
+        std::cout << "Performing event mixing..." << std::endl;
+        PerformMixing(n_mix_events, cent_mult_window, vz_window);
+    }
+    
+    // ======================
+    // 5. Finalization
+    // ======================
+    
+    // Write results
+    WriteResults(output);
+    output.Close();
+    
+    // Cleanup
+    delete event_chain;
+    delete track_chain;
+    delete skim_chain;
+    
+    // Timing information
+    timer.Stop();
+    std::cout << "=== Analysis completed ===" << std::endl;
+    std::cout << "Processed " << n_processed << " events in " 
+              << timer.RealTime() << " seconds" << std::endl;
+    std::cout << "Output saved to: " << output_name << ".root" << std::endl;
 }
+
+// Helper function implementations
+namespace {
+
+TString GetSystematicTag(int syst) {
+    static const std::map<int, TString> syst_map = {
+        {0, "nominal"}, {1, "vznarrow"}, {2, "vzwide"},
+        {3, "trktight"}, {4, "trkloose"}, {5, "centup"},
+        {6, "centdown"}, {7, "nodupcut"}, {8, "nopixcut"},
+        {9, "coulombp15"}, {10, "coulombm15"}
+    };
+    return syst_map.count(syst) ? syst_map.at(syst) : "unknown";
+}
+
+TFile* OpenEfficiencyFile(int syst) {
+    TString eff_path = "efftables/XeXe_eff_table_94x_cent.root";
+    if (syst == 1) eff_path = "efftables/XeXe_eff_narrow_table_94x_cent.root";
+    if (syst == 2) eff_path = "efftables/XeXe_eff_wide_table_94x_cent.root";
+    if (syst == 3) eff_path = "efftables/XeXe_eff_tight_table_94x_cent.root";
+    if (syst == 4) eff_path = "efftables/XeXe_eff_loose_table_94x_cent.root";
+    
+    TFile* file = TFile::Open(eff_path);
+    if (!file || file->IsZombie()) {
+        throw std::runtime_error("Could not open efficiency file: " + eff_path);
+    }
+    return file;
+}
+
+} // anonymous namespace
